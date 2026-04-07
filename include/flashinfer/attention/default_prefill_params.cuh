@@ -22,6 +22,7 @@
 #include <cstdint>
 
 #include "../page.cuh"
+#include "../page_tq4.cuh"
 
 namespace flashinfer {
 
@@ -397,6 +398,59 @@ struct BatchPrefillPagedParams {
         maybe_token_pos_in_items_ptr(nullptr),
         token_pos_in_items_len(0),
         maybe_max_item_len_ptr(nullptr) {}
+
+  __host__ __device__ __forceinline__ uint32_t get_qo_len(uint32_t batch_idx) const {
+    return q_indptr[batch_idx + 1] - q_indptr[batch_idx];
+  }
+
+  __host__ __device__ __forceinline__ uint32_t get_kv_len(uint32_t batch_idx) const {
+    return paged_kv.get_length(batch_idx);
+  }
+};
+
+// ─── TQ4 Paged KV Batch Prefill Params ───────────────────────────────
+// Same as BatchPrefillPagedParams but with paged_kv_tq4_t instead of paged_kv_t.
+// Uses kNone RoPE (already applied before TQ4 scatter).
+
+template <typename DTypeQ_, typename DTypeO_, typename IdType_>
+struct BatchPrefillPagedTQ4Params {
+  using DTypeQ = DTypeQ_;
+  using DTypeKV = nv_bfloat16;  // TQ4 dequant always produces BF16
+  using DTypeO = DTypeO_;
+  using IdType = IdType_;
+
+  DTypeQ* q;
+  paged_kv_tq4_t<IdType> paged_kv;
+  uint8_t* maybe_custom_mask;
+  IdType* q_indptr;
+  IdType* maybe_mask_indptr;
+  IdType* maybe_q_rope_offset;
+  DTypeO* o;
+  float* lse;
+  float* maybe_alibi_slopes;
+  uint_fastdiv group_size;
+  uint32_t num_qo_heads;
+  IdType q_stride_n;
+  IdType q_stride_h;
+  int32_t window_left;
+  float logits_soft_cap;
+  float sm_scale;
+  float rope_rcp_scale;
+  float rope_rcp_theta;
+
+  IdType* request_indices;
+  IdType* qo_tile_indices;
+  IdType* kv_tile_indices;
+  IdType* merge_indptr;
+  IdType* o_indptr;
+  bool* block_valid_mask;
+  IdType* kv_chunk_size_ptr;
+  uint32_t max_total_num_rows;
+  uint32_t* total_num_rows;
+  uint32_t padded_batch_size;
+  bool partition_kv;
+
+  __host__ BatchPrefillPagedTQ4Params() = default;
 
   __host__ __device__ __forceinline__ uint32_t get_qo_len(uint32_t batch_idx) const {
     return q_indptr[batch_idx + 1] - q_indptr[batch_idx];
