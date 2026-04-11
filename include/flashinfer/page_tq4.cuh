@@ -167,9 +167,10 @@ struct paged_kv_tq4_t {
 /*!
  * \brief Append one token per sequence to TQ4 paged KV cache.
  *
- * Input key/value are rotated by Pi^T but not yet normalized.
- * This kernel computes per-row L2 norms, normalizes, quantizes each element
- * to the nearest centroid and stores packed data + norm to the page.
+ * Input key/value are BF16 vectors in the original basis.
+ * This kernel applies Pi^T rotation, computes per-row L2 norms, normalizes,
+ * quantizes each element to the nearest centroid and stores packed data + norm
+ * to the page.
  *
  * Grid: (batch_size, num_heads, 1)
  * Block: (head_dim/2, 1, 1)
@@ -179,8 +180,9 @@ struct paged_kv_tq4_t {
 template <uint32_t head_dim, typename IdType>
 __global__ void AppendPagedKVCacheTQ4DecodeKernel(
     paged_kv_tq4_t<IdType> paged_kv,
-    const float* __restrict__ key_rotated,      // [batch, num_heads, head_dim] F32 rotated vectors
-    const float* __restrict__ value_rotated) {  // [batch, num_heads, head_dim] F32 rotated vectors
+    const __nv_bfloat16* __restrict__ key,      // [batch, num_heads, head_dim] BF16 source vectors
+    const __nv_bfloat16* __restrict__ value,    // [batch, num_heads, head_dim] BF16 source vectors
+    const __nv_bfloat16* __restrict__ rotation_t) {  // [head_dim, head_dim] BF16 Pi^T
 
   const uint32_t tx = threadIdx.x;  // 0 .. head_dim/2-1
   const uint32_t head_idx = blockIdx.y;
@@ -205,12 +207,35 @@ __global__ void AppendPagedKVCacheTQ4DecodeKernel(
   const uint32_t elem_base = tx * 2;
   const uint32_t lane = tx & 31;
   const uint32_t warp_id = tx >> 5;
-  const float* k_src = key_rotated + (batch_idx * num_heads + head_idx) * head_dim;
-  const float* v_src = value_rotated + (batch_idx * num_heads + head_idx) * head_dim;
-  const float k0_raw = k_src[elem_base];
-  const float k1_raw = k_src[elem_base + 1];
-  const float v0_raw = v_src[elem_base];
-  const float v1_raw = v_src[elem_base + 1];
+  const __nv_bfloat16* k_src = key + (batch_idx * num_heads + head_idx) * head_dim;
+  const __nv_bfloat16* v_src = value + (batch_idx * num_heads + head_idx) * head_dim;
+
+  __shared__ __nv_bfloat16 s_k_src[head_dim];
+  __shared__ __nv_bfloat16 s_v_src[head_dim];
+  s_k_src[elem_base] = k_src[elem_base];
+  s_k_src[elem_base + 1] = k_src[elem_base + 1];
+  s_v_src[elem_base] = v_src[elem_base];
+  s_v_src[elem_base + 1] = v_src[elem_base + 1];
+  __syncthreads();
+
+  float k0_raw = 0.f, k1_raw = 0.f;
+  float v0_raw = 0.f, v1_raw = 0.f;
+
+#pragma unroll 4
+  for (uint32_t j = 0; j < head_dim; j += 2) {
+    const float sk0 = __bfloat162float(s_k_src[j]);
+    const float sk1 = __bfloat162float(s_k_src[j + 1]);
+    const float sv0 = __bfloat162float(s_v_src[j]);
+    const float sv1 = __bfloat162float(s_v_src[j + 1]);
+    const float2 rot0 =
+        __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(rotation_t + j * head_dim + elem_base));
+    const float2 rot1 = __bfloat1622float2(
+        *reinterpret_cast<const __nv_bfloat162*>(rotation_t + (j + 1) * head_dim + elem_base));
+    k0_raw += sk0 * rot0.x + sk1 * rot1.x;
+    k1_raw += sk0 * rot0.y + sk1 * rot1.y;
+    v0_raw += sv0 * rot0.x + sv1 * rot1.x;
+    v1_raw += sv0 * rot0.y + sv1 * rot1.y;
+  }
 
   __shared__ float s_k_inv_norm;
   __shared__ float s_v_inv_norm;
@@ -463,8 +488,9 @@ __global__ void AppendPagedKVCacheTQ4ContiguousKernel(
  */
 template <typename IdType>
 cudaError_t AppendPagedKVCacheTQ4Decode(paged_kv_tq4_t<IdType> paged_kv,
-                                         const float* key_rotated,
-                                         const float* value_rotated,
+                                         const __nv_bfloat16* key,
+                                         const __nv_bfloat16* value,
+                                         const __nv_bfloat16* rotation_t,
                                          cudaStream_t stream) {
   constexpr uint32_t HEAD_DIM = 256;  // Must match model head_dim (Qwen3.5 = 256)
   uint32_t batch_size = paged_kv.batch_size;
@@ -474,7 +500,7 @@ cudaError_t AppendPagedKVCacheTQ4Decode(paged_kv_tq4_t<IdType> paged_kv,
   dim3 nthrs(HEAD_DIM / 2);            // head_dim/2 threads per block
 
   auto kernel = AppendPagedKVCacheTQ4DecodeKernel<HEAD_DIM, IdType>;
-  kernel<<<nblks, nthrs, 0, stream>>>(paged_kv, key_rotated, value_rotated);
+  kernel<<<nblks, nthrs, 0, stream>>>(paged_kv, key, value, rotation_t);
   return cudaGetLastError();
 }
 
