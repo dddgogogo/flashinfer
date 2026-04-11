@@ -167,9 +167,9 @@ struct paged_kv_tq4_t {
 /*!
  * \brief Append one token per sequence to TQ4 paged KV cache.
  *
- * Input key/value are pre-processed: normalized to unit vectors and rotated by Pi^T.
- * This kernel quantizes each element to the nearest centroid, packs to 4-bit,
- * and stores packed data + norm to the page.
+ * Input key/value are rotated by Pi^T but not yet normalized.
+ * This kernel computes per-row L2 norms, normalizes, quantizes each element
+ * to the nearest centroid and stores packed data + norm to the page.
  *
  * Grid: (batch_size, num_heads, 1)
  * Block: (head_dim/2, 1, 1)
@@ -179,10 +179,8 @@ struct paged_kv_tq4_t {
 template <uint32_t head_dim, typename IdType>
 __global__ void AppendPagedKVCacheTQ4DecodeKernel(
     paged_kv_tq4_t<IdType> paged_kv,
-    const float* __restrict__ key_rotated,     // [batch, num_heads, head_dim] F32 unit vectors
-    const float* __restrict__ value_rotated,    // [batch, num_heads, head_dim] F32 unit vectors
-    const float* __restrict__ k_norms,          // [batch, num_heads] F32
-    const float* __restrict__ v_norms) {        // [batch, num_heads] F32
+    const float* __restrict__ key_rotated,      // [batch, num_heads, head_dim] F32 rotated vectors
+    const float* __restrict__ value_rotated) {  // [batch, num_heads, head_dim] F32 rotated vectors
 
   const uint32_t tx = threadIdx.x;  // 0 .. head_dim/2-1
   const uint32_t head_idx = blockIdx.y;
@@ -204,16 +202,59 @@ __global__ void AppendPagedKVCacheTQ4DecodeKernel(
   }
   __syncthreads();
 
+  const uint32_t elem_base = tx * 2;
+  const uint32_t lane = tx & 31;
+  const uint32_t warp_id = tx >> 5;
+  const float* k_src = key_rotated + (batch_idx * num_heads + head_idx) * head_dim;
+  const float* v_src = value_rotated + (batch_idx * num_heads + head_idx) * head_dim;
+  const float k0_raw = k_src[elem_base];
+  const float k1_raw = k_src[elem_base + 1];
+  const float v0_raw = v_src[elem_base];
+  const float v1_raw = v_src[elem_base + 1];
+
+  __shared__ float s_k_inv_norm;
+  __shared__ float s_v_inv_norm;
+  __shared__ float s_k_norm;
+  __shared__ float s_v_norm;
+  __shared__ float s_k_partial[head_dim / 64];
+  __shared__ float s_v_partial[head_dim / 64];
+
+  float k_sq = k0_raw * k0_raw + k1_raw * k1_raw;
+  float v_sq = v0_raw * v0_raw + v1_raw * v1_raw;
+#pragma unroll
+  for (uint32_t offset = 16; offset > 0; offset >>= 1) {
+    k_sq += __shfl_down_sync(0xffffffff, k_sq, offset);
+    v_sq += __shfl_down_sync(0xffffffff, v_sq, offset);
+  }
+  if (lane == 0) {
+    s_k_partial[warp_id] = k_sq;
+    s_v_partial[warp_id] = v_sq;
+  }
+  __syncthreads();
+
+  if (warp_id == 0) {
+    float k_block_sq = lane < (head_dim / 64) ? s_k_partial[lane] : 0.f;
+    float v_block_sq = lane < (head_dim / 64) ? s_v_partial[lane] : 0.f;
+#pragma unroll
+    for (uint32_t offset = 16; offset > 0; offset >>= 1) {
+      k_block_sq += __shfl_down_sync(0xffffffff, k_block_sq, offset);
+      v_block_sq += __shfl_down_sync(0xffffffff, v_block_sq, offset);
+    }
+    if (lane == 0) {
+      s_k_norm = sqrtf(k_block_sq);
+      s_v_norm = sqrtf(v_block_sq);
+      s_k_inv_norm = s_k_norm > 0.f ? __fdividef(1.f, s_k_norm) : 0.f;
+      s_v_inv_norm = s_v_norm > 0.f ? __fdividef(1.f, s_v_norm) : 0.f;
+    }
+  }
+  __syncthreads();
+
   // --- Encode K ---
   {
     size_t row_offset = paged_kv.get_row_offset(phys_page, head_idx, entry_idx);
     uint8_t* dst = paged_kv.k_data + row_offset;
-
-    // Load 2 rotated elements
-    uint32_t elem_base = tx * 2;
-    const float* k_src = key_rotated + (batch_idx * num_heads + head_idx) * head_dim;
-    float v0 = k_src[elem_base];
-    float v1 = k_src[elem_base + 1];
+    float v0 = k0_raw * s_k_inv_norm;
+    float v1 = k1_raw * s_k_inv_norm;
 
     // Find nearest centroid for each element
     uint8_t best0 = 0, best1 = 0;
@@ -232,8 +273,7 @@ __global__ void AppendPagedKVCacheTQ4DecodeKernel(
 
     // Thread 0 writes the norm
     if (tx == 0) {
-      float norm = k_norms[batch_idx * num_heads + head_idx];
-      *reinterpret_cast<float*>(dst + head_dim / 2) = norm;
+      *reinterpret_cast<float*>(dst + head_dim / 2) = s_k_norm;
     }
   }
 
@@ -241,11 +281,8 @@ __global__ void AppendPagedKVCacheTQ4DecodeKernel(
   {
     size_t row_offset = paged_kv.get_row_offset(phys_page, head_idx, entry_idx);
     uint8_t* dst = paged_kv.v_data + row_offset;
-
-    uint32_t elem_base = tx * 2;
-    const float* v_src = value_rotated + (batch_idx * num_heads + head_idx) * head_dim;
-    float v0 = v_src[elem_base];
-    float v1 = v_src[elem_base + 1];
+    float v0 = v0_raw * s_v_inv_norm;
+    float v1 = v1_raw * s_v_inv_norm;
 
     uint8_t best0 = 0, best1 = 0;
     float best_dist0 = fabsf(v0 - s_centroids[0]);
@@ -261,8 +298,7 @@ __global__ void AppendPagedKVCacheTQ4DecodeKernel(
     dst[tx] = (best1 << 4) | best0;
 
     if (tx == 0) {
-      float norm = v_norms[batch_idx * num_heads + head_idx];
-      *reinterpret_cast<float*>(dst + head_dim / 2) = norm;
+      *reinterpret_cast<float*>(dst + head_dim / 2) = s_v_norm;
     }
   }
 }
@@ -429,8 +465,6 @@ template <typename IdType>
 cudaError_t AppendPagedKVCacheTQ4Decode(paged_kv_tq4_t<IdType> paged_kv,
                                          const float* key_rotated,
                                          const float* value_rotated,
-                                         const float* k_norms,
-                                         const float* v_norms,
                                          cudaStream_t stream) {
   constexpr uint32_t HEAD_DIM = 256;  // Must match model head_dim (Qwen3.5 = 256)
   uint32_t batch_size = paged_kv.batch_size;
@@ -440,7 +474,7 @@ cudaError_t AppendPagedKVCacheTQ4Decode(paged_kv_tq4_t<IdType> paged_kv,
   dim3 nthrs(HEAD_DIM / 2);            // head_dim/2 threads per block
 
   auto kernel = AppendPagedKVCacheTQ4DecodeKernel<HEAD_DIM, IdType>;
-  kernel<<<nblks, nthrs, 0, stream>>>(paged_kv, key_rotated, value_rotated, k_norms, v_norms);
+  kernel<<<nblks, nthrs, 0, stream>>>(paged_kv, key_rotated, value_rotated);
   return cudaGetLastError();
 }
 
