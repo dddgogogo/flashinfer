@@ -206,7 +206,10 @@ __device__ __inline__ void BatchDecodeWithPagedKVCacheTQ4Device(
   for (uint32_t iter = 0; iter < ceil_div(chunk_size, tile_size); ++iter) {
     const uint32_t iter_base = iter * tile_size;
 
-    // ─── Load and dequant K tile to shared memory ───
+    // ─── Load and dequant K/V tiles to shared memory ───
+    // TQ4 K and V share the same page/entry mapping. Load both with one row-offset
+    // computation so the later compute_qk / update_local_state phases can reuse the
+    // already-populated shared-memory tiles.
     #pragma unroll
     for (uint32_t j = 0; j < tile_size_per_bdx; ++j) {
       const uint32_t tile_idx = (j * bdz + tz) * bdy + ty;
@@ -221,10 +224,16 @@ __device__ __inline__ void BatchDecodeWithPagedKVCacheTQ4Device(
         tq4_dequant_row_to_smem<vec_size>(
             paged_kv.k_data + row_off, centroids_smem,
             k_smem + tile_idx * head_dim, head_dim, tx, true);
+        tq4_dequant_row_to_smem<vec_size>(
+            paged_kv.v_data + row_off, centroids_smem,
+            v_smem + tile_idx * head_dim, head_dim, tx, true);
       } else {
         tq4_dequant_row_to_smem<vec_size>(
             nullptr, centroids_smem,
             k_smem + tile_idx * head_dim, head_dim, tx, false);
+        tq4_dequant_row_to_smem<vec_size>(
+            nullptr, centroids_smem,
+            v_smem + tile_idx * head_dim, head_dim, tx, false);
       }
     }
     block.sync();
@@ -237,29 +246,6 @@ __device__ __inline__ void BatchDecodeWithPagedKVCacheTQ4Device(
         chunk_start + iter_base,
         iter_base, chunk_size, qo_head_idx, kv_head_idx,
         s, st, tx, ty, tz);
-    block.sync();
-
-    // ─── Load and dequant V tile to shared memory ───
-    #pragma unroll
-    for (uint32_t j = 0; j < tile_size_per_bdx; ++j) {
-      const uint32_t tile_idx = (j * bdz + tz) * bdy + ty;
-      const uint32_t abs_token = chunk_start + iter_base + tile_idx;
-      const bool valid = (iter_base + tile_idx < chunk_size);
-
-      if (valid) {
-        uint32_t q_page, r_entry;
-        paged_kv.page_size.divmod(page_base + abs_token, q_page, r_entry);
-        size_t row_off = paged_kv.protective_get_row_offset(
-            q_page, kv_head_idx, r_entry, last_indptr);
-        tq4_dequant_row_to_smem<vec_size>(
-            paged_kv.v_data + row_off, centroids_smem,
-            v_smem + tile_idx * head_dim, head_dim, tx, true);
-      } else {
-        tq4_dequant_row_to_smem<vec_size>(
-            nullptr, centroids_smem,
-            v_smem + tile_idx * head_dim, head_dim, tx, false);
-      }
-    }
     block.sync();
 
     // ─── Update state with V (reused from decode.cuh) ───
