@@ -2961,8 +2961,22 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheTQ4Device(
     logits_transform<KTraits>(params, variant, request_idx, qo_packed_idx_base,
                               kv_idx_base, qo_len, kv_len, group_size, s_frag, tid, kv_head_idx);
 
-    // apply causal mask
-    if (iter >= mask_iteration || iter < window_iteration) {
+    // apply mask
+    //
+    // For MASK_MODE == kCustom the branch must fire on every iter because
+    // the packed mask encodes arbitrary visibility (including the tree-
+    // attention pattern used by DDTree verify). Without this branch
+    // `logits_mask` never runs on TQ4 + kCustom — `mask_iteration` falls
+    // through to `chunk_size / CTA_TILE_KV == num_iterations` (non-causal
+    // else-branch) so `iter >= mask_iteration` is permanently false, and
+    // `window_iteration` is 0 when `window_left < 0`. The non-TQ4 paged
+    // kernel already has the equivalent kCustom branch; see prefill.cuh FP8
+    // main loop for the mirror.
+    if constexpr (MASK_MODE == MaskMode::kCustom) {
+      logits_mask<KTraits>(params, variant, request_idx, qo_packed_idx_base,
+                           kv_idx_base, qo_len, kv_len, chunk_end, group_size, s_frag, tid,
+                           kv_head_idx);
+    } else if (iter >= mask_iteration || iter < window_iteration) {
       logits_mask<KTraits>(params, variant, request_idx, qo_packed_idx_base,
                            kv_idx_base, qo_len, kv_len, chunk_end, group_size, s_frag, tid,
                            kv_head_idx);
