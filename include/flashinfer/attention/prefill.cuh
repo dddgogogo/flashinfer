@@ -2380,6 +2380,18 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
              : chunk_size) /
         CTA_TILE_KV;
 
+    // Ling's DDTree kCustom verify masks always expose the full committed
+    // prefix `[0, kv_len - qo_len)` to every query row. For the first
+    // `prefix_len / CTA_TILE_KV` full tiles in that prefix region, the
+    // packed-mask apply is a provable no-op: every bit is 1. Skip
+    // `logits_mask` on those fully-prefix tiles so the kernel only pays the
+    // custom bit-load / AND cost on the boundary tile and on the tree block
+    // where visibility actually differs.
+    const uint32_t custom_full_prefix_iterations =
+        MASK_MODE == MaskMode::kCustom
+            ? min(chunk_size, sub_if_greater_or_zero(kv_len - qo_len, chunk_start)) / CTA_TILE_KV
+            : 0;
+
 #pragma unroll 1
     for (uint32_t iter = 0; iter < num_iterations;
          iter = (MASK_MODE == MaskMode::kMultiItemScoring)
@@ -2423,9 +2435,11 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
 
       // apply mask
       if (MASK_MODE == MaskMode::kCustom) {
-        logits_mask<KTraits>(params, variant, /*batch_idx=*/request_idx, qo_packed_idx_base,
-                             kv_idx_base, qo_len, kv_len, chunk_end, group_size, s_frag, tid,
-                             kv_head_idx);
+        if (iter >= custom_full_prefix_iterations) {
+          logits_mask<KTraits>(params, variant, /*batch_idx=*/request_idx, qo_packed_idx_base,
+                               kv_idx_base, qo_len, kv_len, chunk_end, group_size, s_frag, tid,
+                               kv_head_idx);
+        }
       } else {
         if constexpr (MASK_MODE != MaskMode::kMultiItemScoring) {
           if (iter >= mask_iteration || iter < window_iteration) {
@@ -2963,19 +2977,19 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheTQ4Device(
 
     // apply mask
     //
-    // For MASK_MODE == kCustom the branch must fire on every iter because
-    // the packed mask encodes arbitrary visibility (including the tree-
-    // attention pattern used by DDTree verify). Without this branch
-    // `logits_mask` never runs on TQ4 + kCustom — `mask_iteration` falls
-    // through to `chunk_size / CTA_TILE_KV == num_iterations` (non-causal
-    // else-branch) so `iter >= mask_iteration` is permanently false, and
-    // `window_iteration` is 0 when `window_left < 0`. The non-TQ4 paged
-    // kernel already has the equivalent kCustom branch; see prefill.cuh FP8
-    // main loop for the mirror.
+    // For Ling's DDTree kCustom verify masks, the committed prefix
+    // `[0, kv_len - qo_len)` is fully visible to every query row. Skip
+    // `logits_mask` on the first full prefix tiles (`prefix_len / CTA_TILE_KV`)
+    // because every packed-mask bit there is 1. The boundary tile and the
+    // tree block still go through the normal custom-mask path.
     if constexpr (MASK_MODE == MaskMode::kCustom) {
-      logits_mask<KTraits>(params, variant, request_idx, qo_packed_idx_base,
-                           kv_idx_base, qo_len, kv_len, chunk_end, group_size, s_frag, tid,
-                           kv_head_idx);
+      const uint32_t custom_full_prefix_iterations =
+          min(chunk_size, sub_if_greater_or_zero(kv_len - qo_len, chunk_start)) / CTA_TILE_KV;
+      if (iter >= custom_full_prefix_iterations) {
+        logits_mask<KTraits>(params, variant, request_idx, qo_packed_idx_base,
+                             kv_idx_base, qo_len, kv_len, chunk_end, group_size, s_frag, tid,
+                             kv_head_idx);
+      }
     } else if (iter >= mask_iteration || iter < window_iteration) {
       logits_mask<KTraits>(params, variant, request_idx, qo_packed_idx_base,
                            kv_idx_base, qo_len, kv_len, chunk_end, group_size, s_frag, tid,
