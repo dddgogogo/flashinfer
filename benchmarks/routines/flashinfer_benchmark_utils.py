@@ -92,6 +92,9 @@ output_column_dict = {
         "eps",
         "use_global_scale",
         "dit_mode",
+        "ppf",
+        "pph",
+        "ppw",
     ],
     "quantization": [
         "alignment",
@@ -215,6 +218,7 @@ benchmark_apis = {
         "add_rmsnorm_fp4quant",
         "fused_rmsnorm_silu",
         "fused_dit_layernorm",
+        "fused_qk_rmsnorm_rope",
     ],
     "quantization": [
         "mxfp8_quantize",
@@ -320,25 +324,27 @@ routine_cc_to_supported_backends = {
     },
     "BatchPrefillWithPagedKVCacheWrapper": {
         # NOTE: trtllm-native calls trtllm_batch_context_with_kv_cache
+        # NOTE: trtllm-fmha-v2 calls trtllm_fmha_v2_prefill
         # NOTE: cudnn-native calls cudnn_batch_prefill_with_kv_cache
         "7.5": [],
         "8.0": ["fa2", "auto", "cudnn", "cudnn-native"],
         "8.6": ["fa2", "auto", "cudnn", "cudnn-native"],
         "8.9": ["fa2", "auto", "cudnn", "cudnn-native"],
-        "9.0": ["fa2", "fa3", "auto", "cudnn", "cudnn-native"],
+        "9.0": ["fa2", "fa3", "auto", "cudnn", "cudnn-native", "trtllm-fmha-v2"],
         "10.0": ["fa2", "auto", "cudnn", "cudnn-native", "trtllm-gen", "trtllm-native"],
         "10.3": ["fa2", "auto", "cudnn", "cudnn-native", "trtllm-gen", "trtllm-native"],
-        "12.0": ["fa2", "auto", "cudnn", "cudnn-native"],
+        "12.0": ["fa2", "auto", "cudnn", "cudnn-native", "trtllm-fmha-v2"],
         "12.1": ["fa2", "auto", "cudnn", "cudnn-native"],
     },
     "BatchPrefillWithRaggedKVCacheWrapper": {
         # NOTE: trtllm-native calls trtllm_ragged_attention_deepseek
+        # NOTE: trtllm-fmha-v2 calls trtllm_fmha_v2_prefill
         # NOTE: cudnn-native calls cudnn_batch_prefill_with_kv_cache
         "7.5": [],
         "8.0": ["fa2", "cudnn", "cudnn-native"],
         "8.6": ["fa2", "cudnn", "cudnn-native"],
         "8.9": ["fa2", "cudnn", "cudnn-native"],
-        "9.0": ["fa2", "fa3", "cudnn", "cudnn-native"],
+        "9.0": ["fa2", "fa3", "cudnn", "cudnn-native", "trtllm-fmha-v2"],
         "10.0": [
             "fa2",
             "cudnn",
@@ -355,7 +361,7 @@ routine_cc_to_supported_backends = {
             "cute-dsl",
             "trtllm-native",
         ],
-        "12.0": ["fa2", "cudnn", "cudnn-native"],
+        "12.0": ["fa2", "cudnn", "cudnn-native", "trtllm-fmha-v2"],
         "12.1": ["fa2", "cudnn", "cudnn-native"],
     },
     "BatchMLAPagedAttentionWrapper": {
@@ -565,6 +571,8 @@ routine_cc_to_supported_backends = {
         "12.0": ["cute-dsl"],
         "12.1": ["cute-dsl"],
     },
+    # fused_qk_rmsnorm_rope: CC check done programmatically via
+    # fused_qk_rmsnorm_rope.is_compute_capability_supported() in the benchmark.
     # QUANTIZATION
     "mxfp8_quantize": {
         "7.5": [],
