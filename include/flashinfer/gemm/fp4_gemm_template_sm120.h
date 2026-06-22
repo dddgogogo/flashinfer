@@ -53,6 +53,40 @@ struct _1SM {};
 
 struct _2SM {};
 
+// Ling fork: SM120 mainloop-schedule discriminator. The SM120 instantiation
+// macro below ignores the SM100-style _1SM/_2SM MainloopSchedule (it hardcodes
+// the schedule) and there is no 2SM multicast on SM120, so the XSM_ template
+// slot is otherwise dead here. We reuse it as a schedule tag: _1SM keeps the
+// default cooperative mainloop; _1SM_PP selects the pingpong mainloop (extra
+// autotune candidate for latency-sensitive / small-tile shapes). See
+// Sm120MainloopScheduleSelector below.
+struct _1SM_PP {};
+
+template <typename XSM_>
+struct Sm120MainloopScheduleSelector {
+  using type = cutlass::gemm::KernelTmaWarpSpecializedCooperative;
+};
+
+template <>
+struct Sm120MainloopScheduleSelector<_1SM_PP> {
+  using type = cutlass::gemm::KernelTmaWarpSpecializedPingpong;
+};
+
+// The instantiation macro always emits a StreamK kernel alias alongside the DP
+// one. The pingpong mainloop does not support the StreamK scheduler (CUTLASS
+// static_assert), so for _1SM_PP fall the StreamK alias back to the persistent
+// (DP) scheduler — it stays compilable and is simply never dispatched (the
+// pingpong tactics are DP-only in flashinfer_nvfp4.cu).
+template <typename XSM_>
+struct Sm120StreamKSchedulerSelector {
+  using type = cutlass::gemm::StreamKScheduler;
+};
+
+template <>
+struct Sm120StreamKSchedulerSelector<_1SM_PP> {
+  using type = cutlass::gemm::StaticPersistentScheduler;
+};
+
 template <typename T>
 struct SMTypeAdapter {};
 
@@ -258,7 +292,7 @@ inline size_t runFp4GemmImpl(void* D, void const* A, void const* B, void const* 
         ElementAccumulator, ThreadBlockShape, ClusterShape,                                                          \
         cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(                                          \
             sizeof(typename CollectiveEpilogue::SharedStorage))>,                                                    \
-        cutlass::gemm::KernelTmaWarpSpecializedCooperative>::CollectiveOp;                                           \
+        typename flashinfer::gemm::Sm120MainloopScheduleSelector<XSM_>::type>::CollectiveOp;                         \
                                                                                                                      \
     /* Two scheduler options for different workloads */                                                              \
     /* See: https://github.com/NVIDIA/cutlass/blob/main/examples/79_blackwell_geforce_gemm */                        \
@@ -270,9 +304,9 @@ inline size_t runFp4GemmImpl(void* D, void const* A, void const* B, void const* 
                                              CollectiveEpilogue, TileSchedulerTag>;                                  \
                                                                                                                      \
     /* Option 2: StreamK scheduler - better load balancing for small M/N, large K */                                 \
-    using GemmKernelStreamK =                                                                                        \
-        cutlass::gemm::kernel::GemmUniversal<cute::Shape<int, int, int, int>, CollectiveMainloop,                    \
-                                             CollectiveEpilogue, cutlass::gemm::StreamKScheduler>;                   \
+    using GemmKernelStreamK = cutlass::gemm::kernel::GemmUniversal<                                                  \
+        cute::Shape<int, int, int, int>, CollectiveMainloop, CollectiveEpilogue,                                     \
+        typename flashinfer::gemm::Sm120StreamKSchedulerSelector<XSM_>::type>;                                       \
                                                                                                                      \
     using GemmDefault = typename cutlass::gemm::device::GemmUniversalAdapter<GemmKernelDefault>;                     \
     using GemmStreamK = typename cutlass::gemm::device::GemmUniversalAdapter<GemmKernelStreamK>;                     \
@@ -280,11 +314,11 @@ inline size_t runFp4GemmImpl(void* D, void const* A, void const* B, void const* 
   };                                                                                                                 \
                                                                                                                      \
   /* Type aliases for DP and StreamK schedulers */                                                                   \
-  using Fp4Gemm_##T##_##CTA_M_##_##CTA_N_##_##CTA_K_##SWAP_AB_ =                                                     \
+  using Fp4Gemm_##T##_##CTA_M_##_##CTA_N_##_##CTA_K_##XSM_##SWAP_AB_ =                                                     \
       DeviceGemmFp4GemmSm120_##T##_##CTA_M_##_##CTA_N_##_##CTA_K_##_##CGA_M_##_##CGA_N_##_##CGA_K_##XSM_##SWAP_AB_:: \
           GemmDefault;                                                                                               \
                                                                                                                      \
-  using Fp4Gemm_##T##_##CTA_M_##_##CTA_N_##_##CTA_K_##SWAP_AB_##_StreamK =                                           \
+  using Fp4Gemm_##T##_##CTA_M_##_##CTA_N_##_##CTA_K_##XSM_##SWAP_AB_##_StreamK =                                           \
       DeviceGemmFp4GemmSm120_##T##_##CTA_M_##_##CTA_N_##_##CTA_K_##_##CGA_M_##_##CGA_N_##_##CGA_K_##XSM_##SWAP_AB_:: \
           GemmStreamK;                                                                                               \
                                                                                                                      \
@@ -296,7 +330,7 @@ inline size_t runFp4GemmImpl(void* D, void const* A, void const* B, void const* 
       void* D, void const* A, void const* B, void const* input_sf, void const* weight_sf,                            \
       float const* global_sf, int m, int n, int k, int batch_count, CutlassGemmConfig gemmConfig,                    \
       char* workspace, const size_t workspaceBytes, cudaStream_t stream, int* occupancy) {                           \
-    using Fp4GemmOperator = Fp4Gemm_##T##_##CTA_M_##_##CTA_N_##_##CTA_K_##SWAP_AB_;                                  \
+    using Fp4GemmOperator = Fp4Gemm_##T##_##CTA_M_##_##CTA_N_##_##CTA_K_##XSM_##SWAP_AB_;                                  \
     if constexpr (SWAP_AB_) {                                                                                        \
       return runFp4GemmImpl<Fp4GemmOperator>(D, B, A, weight_sf, input_sf, global_sf, n, m, k,                       \
                                              batch_count, workspace, workspaceBytes, stream, "");                    \
@@ -314,7 +348,7 @@ inline size_t runFp4GemmImpl(void* D, void const* A, void const* B, void const* 
       void* D, void const* A, void const* B, void const* input_sf, void const* weight_sf,                            \
       float const* global_sf, int m, int n, int k, int batch_count, CutlassGemmConfig gemmConfig,                    \
       char* workspace, const size_t workspaceBytes, cudaStream_t stream, int* occupancy) {                           \
-    using Fp4GemmOperator = Fp4Gemm_##T##_##CTA_M_##_##CTA_N_##_##CTA_K_##SWAP_AB_##_StreamK;                        \
+    using Fp4GemmOperator = Fp4Gemm_##T##_##CTA_M_##_##CTA_N_##_##CTA_K_##XSM_##SWAP_AB_##_StreamK;                        \
     if constexpr (SWAP_AB_) {                                                                                        \
       return runFp4GemmImpl<Fp4GemmOperator>(D, B, A, weight_sf, input_sf, global_sf, n, m, k,                       \
                                              batch_count, workspace, workspaceBytes, stream,                         \
